@@ -85,6 +85,14 @@ class TextEncodeKrea2:
                                "text, >1 amplifies it. 0 = vision tokens carry no signal. Applies to "
                                "every connected reference; no effect without an image.",
                 }),
+                "image_end_percent": ("FLOAT", {
+                    "default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01,
+                    "tooltip": "Fraction of sampling during which the image-informed conditioning is "
+                               "used; after it, a text-only conditioning takes over. 1.0 = image for the "
+                               "whole run (single encoder pass). 0.4 = reference sets composition and "
+                               "identity early, then the prompt alone refines. Costs a second text-encoder "
+                               "pass when below 1.0; no effect without an image.",
+                }),
                 "vision_megapixels": ("FLOAT", {
                     "default": 1.0, "min": 0.1, "max": 8.0, "step": 0.1,
                     "tooltip": "Maximum size (in megapixels) for each reference before the Qwen3-VL "
@@ -224,7 +232,12 @@ class TextEncodeKrea2:
         expands into hundreds of vision tokens, so the usual weight-per-token mechanism cannot
         line up anyway). Instead we wrap the model's ``preprocess_embed``, which is where the
         vision tower's merged patch embeddings — and the DeepStack features injected at those
-        same positions — are produced, and scale both. No-op at 1.0 or on unexpected builds."""
+        same positions — are produced, and scale both. No-op at 1.0 or on unexpected builds.
+
+        The scaling interpolates each vision token toward the *mean* vision token rather than
+        toward zero, so embedding magnitudes stay plausible: 0.0 yields a flat block that still
+        says "an image is here" but carries no specific content, instead of zero vectors that
+        occupy sequence positions far outside anything the encoder saw in training."""
         transformer = None
         if weight != 1.0:
             inner = getattr(clip.cond_stage_model, getattr(clip.cond_stage_model, "clip", ""), None)
@@ -235,12 +248,16 @@ class TextEncodeKrea2:
 
         original = transformer.preprocess_embed
 
+        def toward_mean(t):
+            mean = t.mean(dim=0, keepdim=True)
+            return mean + (t - mean) * weight
+
         def preprocess_embed(embed, device):
             emb, extra = original(embed, device=device)
             if emb is not None and embed.get("type") == "image":
-                emb = emb * weight
+                emb = toward_mean(emb)
                 if extra is not None and extra.get("deepstack") is not None:
-                    extra = {**extra, "deepstack": [d * weight for d in extra["deepstack"]]}
+                    extra = {**extra, "deepstack": [toward_mean(d) for d in extra["deepstack"]]}
             return emb, extra
 
         transformer.preprocess_embed = preprocess_embed
@@ -249,27 +266,41 @@ class TextEncodeKrea2:
         finally:
             del transformer.preprocess_embed  # instance override removed -> class method again
 
-    def encode(self, clip, prompt, image_weight=1.0, vision_megapixels=1.0, mask_padding=0.0,
-               system_prompt=KREA2_SYSTEM_DEFAULT, vision_position="before prompt",
-               print_prompt=False, **kwargs):
+    def encode(self, clip, prompt, image_weight=1.0, image_end_percent=1.0, vision_megapixels=1.0,
+               mask_padding=0.0, system_prompt=KREA2_SYSTEM_DEFAULT,
+               vision_position="before prompt", print_prompt=False, **kwargs):
         images_vl, image_prompt = self._prepare_vision(kwargs, vision_megapixels, mask_padding)
         text, template = self._build_text(system_prompt, prompt, image_prompt, vision_position)
+        # Hand off to a text-only conditioning partway through sampling: the reference then only
+        # shapes the early (composition/identity) steps. Both halves are ordinary encoder outputs,
+        # so nothing here is off-distribution -- unlike blending conditioning tensors, which cannot
+        # be aligned anyway (the vision tokens make the two sequences different lengths).
+        schedule = bool(images_vl) and image_end_percent < 1.0
 
         if print_prompt:
             print("\n========== Text Encode (Krea2) -> Qwen3-VL prompt ==========")
             print(template.replace("{}", text, 1))  # literal replace: brace-safe
-            print("---- references: {} (image_weight {}) ----".format(len(images_vl), image_weight))
+            print("---- references: {} (image_weight {}{}) ----".format(
+                len(images_vl), image_weight,
+                ", image until {:.0%} of sampling".format(image_end_percent) if schedule else ""))
             print("===========================================================\n")
 
         tokens = clip.tokenize(text, images=images_vl, llama_template=template)
+        add_dict = {"start_percent": 0.0, "end_percent": image_end_percent} if schedule else {}
         try:
             with self._scaled_vision(clip, image_weight):
-                conditioning = clip.encode_from_tokens_scheduled(tokens)
+                conditioning = clip.encode_from_tokens_scheduled(tokens, add_dict=add_dict)
         except NotImplementedError as exc:
             hint = self._fp8_hint(exc, images_vl)
             if hint is not None:
                 raise hint from exc
             raise
+
+        if schedule:
+            text_only, _ = self._build_text(system_prompt, prompt, "", vision_position)
+            tokens_text_only = clip.tokenize(text_only, llama_template=template)
+            conditioning = conditioning + clip.encode_from_tokens_scheduled(
+                tokens_text_only, add_dict={"start_percent": image_end_percent, "end_percent": 1.0})
         return (conditioning,)
 
 
