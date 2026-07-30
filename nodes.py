@@ -18,6 +18,7 @@ This node differs from ``TextEncodeQwenImageEdit`` in two ways:
   * it has no VAE input, and it accepts an unbounded, auto-growing set of image+mask slots.
 """
 
+import contextlib
 import math
 import re
 
@@ -76,6 +77,14 @@ class TextEncodeKrea2:
                 # image1/mask1 are the seed pair; the web extension grows image2/mask2, ... on connect.
                 "image1": ("IMAGE",),
                 "mask1": ("MASK",),
+                "image_weight": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 3.0, "step": 0.05,
+                    "tooltip": "How strongly the reference image(s) influence the conditioning. Scales "
+                               "the Qwen3-VL vision embeddings (and their DeepStack features) before the "
+                               "text encoder: 1.0 = unmodified, <1 weakens the image relative to your "
+                               "text, >1 amplifies it. 0 = vision tokens carry no signal. Applies to "
+                               "every connected reference; no effect without an image.",
+                }),
                 "vision_megapixels": ("FLOAT", {
                     "default": 1.0, "min": 0.1, "max": 8.0, "step": 0.1,
                     "tooltip": "Maximum size (in megapixels) for each reference before the Qwen3-VL "
@@ -206,7 +215,41 @@ class TextEncodeKrea2:
             )
         return None
 
-    def encode(self, clip, prompt, vision_megapixels=1.0, mask_padding=0.0,
+    @staticmethod
+    @contextlib.contextmanager
+    def _scaled_vision(clip, weight):
+        """Temporarily scale the vision embeddings produced by Qwen3-VL's vision tower.
+
+        Comfy's tokenizer disables per-token weights for the Qwen path (and one image_pad token
+        expands into hundreds of vision tokens, so the usual weight-per-token mechanism cannot
+        line up anyway). Instead we wrap the model's ``preprocess_embed``, which is where the
+        vision tower's merged patch embeddings — and the DeepStack features injected at those
+        same positions — are produced, and scale both. No-op at 1.0 or on unexpected builds."""
+        transformer = None
+        if weight != 1.0:
+            inner = getattr(clip.cond_stage_model, getattr(clip.cond_stage_model, "clip", ""), None)
+            transformer = getattr(inner, "transformer", None)
+        if transformer is None or not hasattr(transformer, "preprocess_embed"):
+            yield
+            return
+
+        original = transformer.preprocess_embed
+
+        def preprocess_embed(embed, device):
+            emb, extra = original(embed, device=device)
+            if emb is not None and embed.get("type") == "image":
+                emb = emb * weight
+                if extra is not None and extra.get("deepstack") is not None:
+                    extra = {**extra, "deepstack": [d * weight for d in extra["deepstack"]]}
+            return emb, extra
+
+        transformer.preprocess_embed = preprocess_embed
+        try:
+            yield
+        finally:
+            del transformer.preprocess_embed  # instance override removed -> class method again
+
+    def encode(self, clip, prompt, image_weight=1.0, vision_megapixels=1.0, mask_padding=0.0,
                system_prompt=KREA2_SYSTEM_DEFAULT, vision_position="before prompt",
                print_prompt=False, **kwargs):
         images_vl, image_prompt = self._prepare_vision(kwargs, vision_megapixels, mask_padding)
@@ -215,12 +258,13 @@ class TextEncodeKrea2:
         if print_prompt:
             print("\n========== Text Encode (Krea2) -> Qwen3-VL prompt ==========")
             print(template.replace("{}", text, 1))  # literal replace: brace-safe
-            print("---- references: {} ----".format(len(images_vl)))
+            print("---- references: {} (image_weight {}) ----".format(len(images_vl), image_weight))
             print("===========================================================\n")
 
         tokens = clip.tokenize(text, images=images_vl, llama_template=template)
         try:
-            conditioning = clip.encode_from_tokens_scheduled(tokens)
+            with self._scaled_vision(clip, image_weight):
+                conditioning = clip.encode_from_tokens_scheduled(tokens)
         except NotImplementedError as exc:
             hint = self._fp8_hint(exc, images_vl)
             if hint is not None:
